@@ -120,7 +120,7 @@
      exp-invocacion)
 
     ;; VARIABLES Y CONSTANTES
-    (expresion ("var" identificador "=" expresion ";")   exp-var)
+    (expresion ("var" (separated-list identificador "=" expresion ",") ";") exp-var)
     (expresion ("const" identificador "=" expresion ";") exp-const)
     (expresion ("set" identificador "=" expresion ";")   exp-asignacion)
 
@@ -160,16 +160,26 @@
      ("while" expresion "do" expresion "done")
      exp-while)
 
-    ;; FUNC — definicion de funcion
+    ;; FUNC — definicion de funcion (sin return obligatorio al final)
     (expresion
      ("func" identificador "(" (separated-list identificador ",") ")"
-      "{" (arbno expresion) "return" expresion ";" "}")
+      "{" (arbno expresion) "}")
      exp-func)
+
+    ;; RETURN como expresión — puede usarse en cualquier parte del cuerpo
+    (expresion ("return" expresion ";") exp-return)
 
     ;; SWITCH
     (expresion
      ("switch" expresion "{" (arbno "case" expresion ":" expresion) "default" ":" expresion "}")
      exp-switch)
+
+    (expresion ("for" identificador "in" expresion "do" expresion "done") exp-for)
+
+    ;; LISTAS literales: [e1, e2, ...]
+    (expresion
+     ("[" (separated-list expresion ",") "]")
+     exp-lista)
     ))
 
 (sllgen:make-define-datatypes lexica gramatica)
@@ -193,7 +203,7 @@
 
 (define extender-ambiente
   (lambda (env nombre valor constante?)
-    (cons (list nombre valor constante?) env)))
+    (cons (list nombre (vector valor) constante?) env)))
 
 (define actualizar-ambiente
   (lambda (env nombre nuevo-valor)
@@ -204,10 +214,11 @@
        (if (caddr (car env))
            (eopl:error 'actualizar-ambiente
                        "No se puede modificar la constante: ~s" nombre)
-           (cons (list nombre nuevo-valor #f) (cdr env))))
+           (begin
+             (vector-set! (cadr (car env)) 0 nuevo-valor)
+             env)))
       (else
-       (cons (car env)
-             (actualizar-ambiente (cdr env) nombre nuevo-valor))))))
+       (actualizar-ambiente (cdr env) nombre nuevo-valor)))))
 
 ;; ============================================================
 ;; INTÉRPRETE
@@ -217,6 +228,10 @@
   (lambda (codigo)
     (evaluar-programa (scan&parse codigo) (ambiente-vacio))
     (display "")))
+
+;; Continuación de "return" activa durante la ejecución de una función.
+;; #f cuando no estamos dentro de ninguna función.
+(define current-return-k (make-parameter #f))
 
 (define evaluar-programa
   (lambda (prog env)
@@ -238,6 +253,17 @@
                      (nuevo-env  (cadr resultado)))
                 (loop (cdr exps) nuevo-env val)))))))
 
+(define evaluar-declaraciones
+  (lambda (ids exps env constante?)
+    (let loop ((ids ids) (exps exps) (env-actual env) (ultimo 0))
+      (if (null? ids)
+          (list ultimo env-actual)
+          (let* ((r   (evaluar-exp (car exps) env-actual))
+                 (val (car r))
+                 (e2  (cadr r))
+                 (e3  (extender-ambiente e2 (car ids) val constante?)))
+            (loop (cdr ids) (cdr exps) e3 val))))))
+
 (define evaluar-exp
   (lambda (exp env)
     (cases expresion exp
@@ -251,19 +277,16 @@
 
       ;; identificador solo, o invocacion identificador(args)
       (exp-identificador (id)
-        (let ((entrada (buscar-variable env id)))
-          (list (cadr entrada) env)))
+  (let ((entrada (buscar-variable env id)))
+    (list (vector-ref (cadr entrada) 0) env)))
 
       (exp-invocacion (id args-exps)
-        (let* ((entrada  (buscar-variable env id))
-               (clausura (cadr entrada)))
-          (invocar-funcion clausura args-exps env)))
+  (let* ((entrada  (buscar-variable env id))
+         (clausura (vector-ref (cadr entrada) 0)))
+    (invocar-funcion clausura args-exps env)))
 
-      (exp-var (id exp-val)
-        (let* ((r   (evaluar-exp exp-val env))
-               (val (car r))
-               (e2  (cadr r)))
-          (list val (extender-ambiente e2 id val #f))))
+      (exp-var (ids exps)
+        (evaluar-declaraciones ids exps env #f))
 
       (exp-const (id exp-val)
         (let* ((r   (evaluar-exp exp-val env))
@@ -283,7 +306,12 @@
                (v2 (car r2)))
           (list
            (cases op-binario op
-             (op-suma-t        () (+ v1 v2))
+             (op-suma-t ()
+                        (cond
+                          ((and (string? v1) (string? v2)) (string-append v1 v2))
+                          ((string? v1) (string-append v1 (valor->string v2)))
+                          ((string? v2) (string-append (valor->string v1) v2))
+                          (else (+ v1 v2))))
              (op-resta-t       () (- v1 v2))
              (op-mult-t        () (* v1 v2))
              (op-div-t         ()
@@ -348,9 +376,21 @@
                 (list ultimo env-actual)))))
 
      ;; FUNC — guarda la funcion como una clausura en el ambiente
-      (exp-func (nombre parametros cuerpo retorno)
-        (let ((clausura (list 'clausura parametros cuerpo retorno env)))
-          (list clausura (extender-ambiente env nombre clausura #f))))
+      (exp-func (nombre parametros cuerpo)
+                (let* ((env-extendido (extender-ambiente env nombre 'pendiente #f))
+                       (celda-funcion (cadr (car env-extendido)))
+                       (clausura      (list 'clausura parametros cuerpo env-extendido)))
+                  (vector-set! celda-funcion 0 clausura)
+                  (list clausura env-extendido)))
+
+      ;; RETURN — corta la ejecución de la función actual devolviendo v
+      (exp-return (e)
+        (let* ((r (evaluar-exp e env))
+               (v (car r))
+               (k (current-return-k)))
+          (if k
+              (k v)
+              (eopl:error 'exp-return "return usado fuera de una función"))))
 
       ;; SWITCH
       (exp-switch (control casos-exps casos-vals default-val)
@@ -365,7 +405,44 @@
                  (if (equal? v vc)
                      (evaluar-exp (car vs) env)
                      (buscar (cdr cs) (cdr vs)))))))))
+
+      ;; FOR id IN exp DO cuerpo DONE
+      (exp-for (id exp-iterable cuerpo)
+        (let* ((r          (evaluar-exp exp-iterable env))
+               (coleccion  (car r))
+               (env-base   (cadr r)))
+          (if (not (list? coleccion))
+              (eopl:error 'exp-for "for espera una lista, se obtuvo: ~s" coleccion)
+              (let loop ((elems coleccion) (env-actual env-base) (ultimo 0))
+                (if (null? elems)
+                    (list ultimo env-actual)
+                    (let* ((env-iter (extender-ambiente env-actual id (car elems) #f))
+                           (r2       (evaluar-exp cuerpo env-iter))
+                           (v2       (car r2))
+                           (env-post (cadr r2))
+                           (env-siguiente (remover-liga env-post id)))
+                      (loop (cdr elems) env-siguiente v2)))))))
+      
+      ;; LISTA literal: [e1, e2, ...]
+      (exp-lista (exps)
+        (let loop ((exps exps) (env-actual env) (acc '()))
+          (if (null? exps)
+              (list (reverse acc) env-actual)
+              (let* ((r (evaluar-exp (car exps) env-actual))
+                     (v (car r))
+                     (e2 (cadr r)))
+                (loop (cdr exps) e2 (cons v acc))))))
       )))
+
+;; ============================================================
+;; FUNCION AUXILIAR 
+;; ============================================================
+(define remover-liga
+  (lambda (env nombre)
+    (cond
+      ((null? env) env)
+      ((eq? (caar env) nombre) (cdr env))
+      (else (cons (car env) (remover-liga (cdr env) nombre))))))
 
 ;; ============================================================
 ;; INVOCACION DE FUNCIONES
@@ -373,17 +450,21 @@
 
 (define invocar-funcion
   (lambda (clausura args-exps env-llamador)
-    (let* ((parametros   (cadr clausura))
-           (cuerpo       (caddr clausura))
-           (retorno      (cadddr clausura))
-           (env-definicion (car (cddddr clausura))))
-      (let* ((env-funcion (crear-ambiente-funcion parametros args-exps env-llamador env-definicion)))
-        (let loop ((exps cuerpo) (env-actual env-funcion))
-          (if (null? exps)
-              (evaluar-exp retorno env-actual)
-              (let* ((r (evaluar-exp (car exps) env-actual))
-                     (nuevo-env (cadr r)))
-                (loop (cdr exps) nuevo-env))))))))
+    (let* ((parametros     (cadr clausura))
+           (cuerpo         (caddr clausura))
+           (env-definicion (cadddr clausura))
+           (env-funcion    (crear-ambiente-funcion parametros args-exps env-llamador env-definicion))
+           (valor
+            (call-with-current-continuation
+             (lambda (k)
+               (parameterize ((current-return-k k))
+                 (let loop ((exps cuerpo) (env-actual env-funcion))
+                   (if (null? exps)
+                       'null              ;; sin return en el cuerpo -> null
+                       (let* ((r (evaluar-exp (car exps) env-actual))
+                              (nuevo-env (cadr r)))
+                         (loop (cdr exps) nuevo-env)))))))))
+      (list valor env-llamador))))
 
 (define crear-ambiente-funcion
   (lambda (parametros args-exps env-llamador env-definicion)
@@ -416,5 +497,14 @@
       ((eq? v 'null) "null")
       ((number? v)   (number->string v))
       ((string? v)   v)
+      ((list? v)     (string-append "[" (unir-con-comas (map valor->string v)) "]"))
       ((symbol? v)   (symbol->string v))
       (else          (symbol->string v)))))
+
+;; Une una lista de strings con ", " sin depender de racket/string
+(define unir-con-comas
+  (lambda (strs)
+    (cond
+      ((null? strs) "")
+      ((null? (cdr strs)) (car strs))
+      (else (string-append (car strs) ", " (unir-con-comas (cdr strs)))))))
